@@ -1,0 +1,908 @@
+=== SOLUTION ARCHITECTURE BLUEPRINT ===
+
+Device Models and Roles:
+- Router: Cisco ISR 4331 - Branch core router, WAN/Internet, security, and redundancy
+- Switch: Cisco Catalyst 9300-48P - Core switch (StackWise), VLAN gateway, distribution uplinks
+- Switch: Cisco Catalyst 9300-24T - Secondary core/distribution switch for redundancy
+- Switch: Cisco Catalyst 2960-X-48FPD-L - Access layer, PoE+ for IP cameras/phones
+- Firewall: Cisco ASA 5516-X - Security firewall, NGFW/IPS/PCI-DSS boundary enforcement
+- Wireless Controller: Cisco 5520 WLC - Centralized WiFi, enterprise SSIDs, WPA3-Enterprise
+- Voice Gateway: Cisco ISR 4321 - SIP trunking, emergency comms QoS, classified VoIP
+
+Network Topology Description:
+- Hierarchical, fully redundant, segmented topology.  
+- Dual-core C9300s with StackWise forming distribution, connecting to ISR 4331 for WAN/core, and ASA 5516-X as the perimeter security boundary.  
+- Access 2960-X switches provide PoE to endpoints; trunked to C9300s.  
+- All branch segments on dedicated VLANs; SVI routing at core, strict firewall inter-VLAN policy.  
+- Wireless infrastructure via Cisco 5520 WLC connected to core switch stack.  
+- Voice connected via ISR 4321. WAN/Internet via ISR 4331 dual connections (fiber/cellular), with voice/data QoS, redundancy, enterprise security.
+
+CRITICAL P2P VALIDATION REQUIREMENTS:
+1. Interconnections use 10.10.255.0/24 /30 links, each described at both ends, with matching addressing.
+2. All trunk and VLAN configs strictly match on both sides.
+3. OSPF is the internal routing protocol using Area 0 for all backbone segments.
+
+---
+
+=== DEVICE 1: BR-ROUTER-01 (Cisco ISR 4331) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-ROUTER-01
+no ip domain-lookup
+ip domain-name branchbank.int
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+enable secret !REDACTED!
+username admin privilege 15 secret !REDACTED!
+aaa new-model
+aaa authentication login default group tacacs+ local
+aaa authorization exec default group tacacs+ local
+aaa session-id common
+banner login ^C
+*** WARNING: Authorized Personnel Only ***
+PCI-DSS Zone. All access and actions are logged and monitored.
+^C
+!
+clock timezone EST -5 0
+ntp server 10.10.255.6 prefer
+ntp server 192.168.100.10
+ntp update-calendar
+!
+logging buffered 64000 debugging
+logging host 192.168.100.20
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+ip ssh authentication-retries 2
+ip ssh time-out 60
+!
+ip http server
+ip http secure-server
+ip http authentication aaa
+!
+ip tacacs source-interface GigabitEthernet0/0/0
+tacacs-server host 192.168.100.21 key !REDACTED!
+tacacs-server directed-request
+!
+snmp-server community BANKMON ro 10
+snmp-server location Branch
+snmp-server contact noc@bank.int
+snmp-server host 192.168.100.20 version 3 auth BANKMON
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+
+! --- WAN Primary: Fiber Internet Connection ---
+interface GigabitEthernet0/0/0
+ description Uplink to ISP1 (Primary Fiber)
+ ip address dhcp
+ ip nat outside
+ ip access-group WAN-INBOUND in
+ ip inspect BANKING_TRAFFIC out
+ no shutdown
+
+! --- WAN Secondary: 4G LTE Backup ---
+interface Cellular0/1/0
+ description LTE Failover to ISP2
+ ip address negotiated
+ ip nat outside
+ dialer profile 1
+ no shutdown
+
+! --- P2P to Core Switch 1 ---
+interface GigabitEthernet0/0/1
+ description P2P to BR-CORE1 Gi1/1
+ ip address 10.10.255.1 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+ no shutdown
+
+! --- P2P to Core Switch 2 ---
+interface GigabitEthernet0/0/2
+ description P2P to BR-CORE2 Gi1/2
+ ip address 10.10.255.5 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+ no shutdown
+
+! --- Loopback for OSPF Router-ID/Management ---
+interface Loopback0
+ description Router-ID/Management Interface
+ ip address 10.10.255.250 255.255.255.255
+
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+
+router ospf 1
+ router-id 10.10.255.250
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ no passive-interface GigabitEthernet0/0/2
+ network 10.10.255.0 0.0.0.255 area 0
+ redistribute static subnets
+
+! --- Static Routes for DMZ/Firewall ---
+ip route 192.168.10.0 255.255.255.0 10.10.255.2
+ip route 192.168.20.0 255.255.255.0 10.10.255.2
+ip route 192.168.30.0 255.255.255.0 10.10.255.2
+ip route 192.168.40.0 255.255.255.0 10.10.255.2
+ip route 192.168.50.0 255.255.255.0 10.10.255.2
+ip route 192.168.60.0 255.255.255.0 10.10.255.2
+ip route 192.168.100.0 255.255.255.0 10.10.255.2
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+
+! --- PCI-DSS Firewall Zoning, IDS/IPS, Access Control ---
+ip inspect BANKING_TRAFFIC tcp
+ip inspect BANKING_TRAFFIC udp
+ip inspect BANKING_TRAFFIC icmp
+!
+ip access-list extended WAN-INBOUND
+ permit tcp any host <PUBLIC-IP> eq 443
+ permit tcp any host <PUBLIC-IP> eq 22
+ permit icmp any any echo-reply
+ deny   ip any any log
+!
+ip access-list extended BANKING-ONLY
+ permit ip 192.168.10.0 0.0.0.255 any log
+ deny   ip 192.168.20.0 0.0.0.255 192.168.10.0 0.0.0.255 log
+ deny   ip 192.168.40.0 0.0.0.255 192.168.10.0 0.0.0.255 log
+ permit ip any any
+!
+! --- NAT for internal subnets ---
+ip nat inside source list 101 interface GigabitEthernet0/0/0 overload
+access-list 101 permit ip 192.168.0.0 0.0.255.255 any
+!
+! --- AAA, SSH, Secure Management ---
+line vty 0 4
+ transport input ssh
+ login local
+ privilege level 15
+!
+! --- QoS Policy for Bandwidth/VoIP/Banking ---
+class-map match-any VOICE-TRAFFIC
+ match ip dscp ef
+class-map match-any CRITICAL-BANKING
+ match ip access-group name BANKING-ONLY
+!
+policy-map WAN-QOS
+ class VOICE-TRAFFIC
+  priority percent 20
+ class CRITICAL-BANKING
+  bandwidth percent 80
+ class class-default
+  fair-queue
+!
+interface GigabitEthernet0/0/0
+ service-policy output WAN-QOS
+!
+! --- Audit Logging & Compliance ---
+archive
+ path flash:archive/auto-backup
+ write-memory
+ log config
+ logging enable
+ notify syslog
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 2: BR-CORE1 (Cisco Catalyst 9300-48P) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-CORE1
+no ip domain-lookup
+ip domain-name branchbank.int
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+enable secret !REDACTED!
+username admin privilege 15 secret !REDACTED!
+!
+stackwise-virtual
+!
+logging buffered 64000 debugging
+logging host 192.168.100.20
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+!
+vtp mode transparent
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+  name CORE-BANKING
+vlan 20
+  name ATM
+vlan 30
+  name TELLER
+vlan 40
+  name WIFI-GUEST
+vlan 50
+  name SECURITY
+vlan 60
+  name VOIP
+vlan 100
+  name MGMT
+
+! --- Trunk to BR-CORE2 ---
+interface GigabitEthernet1/0/48
+ description Stackwise Connect to BR-CORE2 Gi1/0/48
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ channel-group 1 mode active
+!
+
+! --- Trunks to BR-ACCESS1, BR-ACCESS2 ---
+interface GigabitEthernet1/1/1
+ description Trunk to BR-ACCESS1 Gi1/0/48
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ spanning-tree portfast trunk
+!
+interface GigabitEthernet1/1/2
+ description Trunk to BR-ACCESS2 Gi1/0/48
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ spanning-tree portfast trunk
+!
+! --- P2P link to BR-ROUTER-01 ---
+interface GigabitEthernet1/1/3
+ description P2P to BR-ROUTER-01 Gi0/0/1
+ no switchport
+ ip address 10.10.255.2 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+!
+
+! --- Uplink to Firewall ---
+interface GigabitEthernet1/1/4
+ description Uplink to BR-FW-01 Gi0/1
+ no switchport
+ ip address 10.10.255.9 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+!
+
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+! --- SVIs for all VLANs, HSRP for redundancy with BR-CORE2 ---
+interface Vlan10
+ description SVI-Core Banking
+ ip address 192.168.10.1 255.255.255.0
+ standby 10 ip 192.168.10.254
+ standby 10 priority 110
+ standby 10 preempt
+ ip ospf 1 area 0
+!
+interface Vlan20
+ description SVI-ATM
+ ip address 192.168.20.1 255.255.255.0
+ standby 20 ip 192.168.20.254
+ standby 20 priority 110
+ standby 20 preempt
+ ip ospf 1 area 0
+!
+interface Vlan30
+ description SVI-Teller
+ ip address 192.168.30.1 255.255.255.0
+ standby 30 ip 192.168.30.254
+ standby 30 priority 110
+ standby 30 preempt
+ ip ospf 1 area 0
+!
+interface Vlan40
+ description SVI-WiFi-Guest
+ ip address 192.168.40.1 255.255.255.0
+ standby 40 ip 192.168.40.254
+ standby 40 priority 110
+ standby 40 preempt
+ ip ospf 1 area 0
+!
+interface Vlan50
+ description SVI-Security
+ ip address 192.168.50.1 255.255.255.0
+ standby 50 ip 192.168.50.254
+ standby 50 priority 110
+ standby 50 preempt
+ ip ospf 1 area 0
+!
+interface Vlan60
+ description SVI-VoIP
+ ip address 192.168.60.1 255.255.255.0
+ standby 60 ip 192.168.60.254
+ standby 60 priority 110
+ standby 60 preempt
+ ip ospf 1 area 0
+!
+interface Vlan100
+ description SVI-Management
+ ip address 192.168.100.1 255.255.255.0
+ standby 100 ip 192.168.100.254
+ standby 100 priority 110
+ standby 100 preempt
+ ip ospf 1 area 0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.10.255.2
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan40
+ no passive-interface Vlan50
+ no passive-interface Vlan60
+ no passive-interface Vlan100
+ no passive-interface GigabitEthernet1/1/3
+ no passive-interface GigabitEthernet1/1/4
+ network 192.168.0.0 0.0.255.255 area 0
+ network 10.10.255.0 0.0.0.255 area 0
+!
+ip routing
+ip default-gateway 10.10.255.1
+ip route 0.0.0.0 0.0.0.0 10.10.255.1
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+! --- TACACS, SSH, SNMP, Compliance Logging ---
+ip tacacs source-interface Vlan100
+tacacs-server host 192.168.100.21 key !REDACTED!
+tacacs-server directed-request
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+!
+snmp-server community BANKMON ro 10
+snmp-server location Branch Core
+snmp-server contact noc@bank.int
+snmp-server host 192.168.100.20 version 3 auth BANKMON
+!
+! --- Port-security (uplink and edge only for trunk/PoE) ---
+interface range Gi1/0/1-47
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging time 2
+ switchport port-security aging type inactivity
+!
+! --- QoS Trust for VoIP ---
+mls qos trust dscp
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 3: BR-CORE2 (Cisco Catalyst 9300-24T) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-CORE2
+no ip domain-lookup
+ip domain-name branchbank.int
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+enable secret !REDACTED!
+username admin privilege 15 secret !REDACTED!
+!
+logging buffered 64000 debugging
+logging host 192.168.100.20
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+vtp mode transparent
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10,20,30,40,50,60,100
+
+! --- Trunk to BR-CORE1 ---
+interface GigabitEthernet1/0/48
+ description Stackwise Connect to BR-CORE1 Gi1/0/48
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ channel-group 1 mode active
+!
+
+! --- Trunk to BR-ACCESS2 ---
+interface GigabitEthernet1/1/1
+ description Trunk to BR-ACCESS2 Gi1/0/48
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ spanning-tree portfast trunk
+!
+! --- P2P to BR-ROUTER-01 ---
+interface GigabitEthernet1/1/2
+ description P2P to BR-ROUTER-01 Gi0/0/2
+ no switchport
+ ip address 10.10.255.6 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+!
+! --- Uplink to Firewall ---
+interface GigabitEthernet1/1/3
+ description Uplink to BR-FW-01 Gi0/2
+ no switchport
+ ip address 10.10.255.13 255.255.255.252
+ ip ospf network point-to-point
+ ip ospf 1 area 0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface Vlan10
+ description SVI-Core Banking (HSRP Standby)
+ ip address 192.168.10.2 255.255.255.0
+ standby 10 ip 192.168.10.254
+ standby 10 priority 100
+ standby 10 preempt
+ ip ospf 1 area 0
+!
+interface Vlan20
+ description SVI-ATM
+ ip address 192.168.20.2 255.255.255.0
+ standby 20 ip 192.168.20.254
+ standby 20 priority 100
+ standby 20 preempt
+ ip ospf 1 area 0
+!
+interface Vlan30
+ description SVI-Teller
+ ip address 192.168.30.2 255.255.255.0
+ standby 30 ip 192.168.30.254
+ standby 30 priority 100
+ standby 30 preempt
+ ip ospf 1 area 0
+!
+interface Vlan40
+ description SVI-WiFi-Guest
+ ip address 192.168.40.2 255.255.255.0
+ standby 40 ip 192.168.40.254
+ standby 40 priority 100
+ standby 40 preempt
+ ip ospf 1 area 0
+!
+interface Vlan50
+ description SVI-Security
+ ip address 192.168.50.2 255.255.255.0
+ standby 50 ip 192.168.50.254
+ standby 50 priority 100
+ standby 50 preempt
+ ip ospf 1 area 0
+!
+interface Vlan60
+ description SVI-VoIP
+ ip address 192.168.60.2 255.255.255.0
+ standby 60 ip 192.168.60.254
+ standby 60 priority 100
+ standby 60 preempt
+ ip ospf 1 area 0
+!
+interface Vlan100
+ description SVI-Management
+ ip address 192.168.100.2 255.255.255.0
+ standby 100 ip 192.168.100.254
+ standby 100 priority 100
+ standby 100 preempt
+ ip ospf 1 area 0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.10.255.6
+ passive-interface default
+ no passive-interface Vlan10
+ no passive-interface Vlan20
+ no passive-interface Vlan30
+ no passive-interface Vlan40
+ no passive-interface Vlan50
+ no passive-interface Vlan60
+ no passive-interface Vlan100
+ no passive-interface GigabitEthernet1/1/2
+ no passive-interface GigabitEthernet1/1/3
+ network 192.168.0.0 0.0.255.255 area 0
+ network 10.10.255.0 0.0.0.255 area 0
+!
+ip routing
+ip default-gateway 10.10.255.5
+ip route 0.0.0.0 0.0.0.0 10.10.255.5
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+ip tacacs source-interface Vlan100
+tacacs-server host 192.168.100.21 key !REDACTED!
+tacacs-server directed-request
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+!
+snmp-server community BANKMON ro 10
+snmp-server location Branch Core2
+snmp-server contact noc@bank.int
+snmp-server host 192.168.100.20 version 3 auth BANKMON
+!
+interface range Gi1/0/1-23
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging time 2
+ switchport port-security aging type inactivity
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 4: BR-ACCESS1 (Cisco Catalyst 2960-X-48FPD-L) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-ACCESS1
+no ip domain-lookup
+ip domain-name branchbank.int
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+enable secret !REDACTED!
+username admin privilege 15 secret !REDACTED!
+!
+logging buffered 32000 debugging
+logging host 192.168.100.20
+logging trap informational
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+!
+vtp mode transparent
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10,20,30,40,50,60,100
+
+interface GigabitEthernet1/0/48
+ description Uplink to BR-CORE1 Gi1/1/1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ spanning-tree portfast trunk
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+
+! --- All Access Ports ---
+interface range Gi1/0/1-10
+ description ATM Endpoints
+ switchport mode access
+ switchport access vlan 20
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ spanning-tree portfast
+!
+interface range Gi1/0/11-28
+ description Teller Terminals
+ switchport mode access
+ switchport access vlan 30
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ spanning-tree portfast
+!
+interface range Gi1/0/29-36
+ description Security Cameras/Systems
+ switchport mode access
+ switchport access vlan 50
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ power inline auto
+ spanning-tree portfast
+!
+interface range Gi1/0/37-42
+ description Phones/VoIP
+ switchport mode access
+ switchport access vlan 60
+ switchport voice vlan 60
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ power inline never
+ spanning-tree portfast
+!
+interface range Gi1/0/43-46
+ description Customer WiFi APs
+ switchport mode access
+ switchport access vlan 40
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ power inline auto
+ spanning-tree portfast
+!
+interface range Gi1/0/47
+ description Network Management
+ switchport mode access
+ switchport access vlan 100
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ spanning-tree portfast
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+ip tacacs source-interface Vlan100
+tacacs-server host 192.168.100.21 key !REDACTED!
+tacacs-server directed-request
+!
+snmp-server community BANKMON ro 10
+snmp-server host 192.168.100.20 version 3 auth BANKMON
+crypto key generate rsa modulus 4096
+ip ssh version 2
+!
+spanning-tree bpduguard enable
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 5: BR-FW-01 (Cisco ASA 5516-X) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-FW-01
+enable password !REDACTED! encrypted
+names
+!
+interface GigabitEthernet0/0
+ description Outside - Internet
+ nameif outside
+ security-level 0
+ ip address dhcp setroute
+!
+interface GigabitEthernet0/1
+ description Inside - Core1
+ nameif inside-core1
+ security-level 100
+ ip address 10.10.255.10 255.255.255.252
+!
+interface GigabitEthernet0/2
+ description Inside - Core2
+ nameif inside-core2
+ security-level 100
+ ip address 10.10.255.14 255.255.255.252
+!
+interface Management0/0
+ management-only
+ nameif management
+ security-level 0
+ ip address 192.168.100.10 255.255.255.0
+!
+shutdown interface GigabitEthernet0/3
+
+ftp mode passive
+!
+console timeout 15
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+aaa-server BANK_TACACS protocol tacacs+
+aaa-server BANK_TACACS (management) host 192.168.100.21
+ key !REDACTED!
+!
+aaa authentication enable console BANK_TACACS LOCAL
+aaa authentication ssh console BANK_TACACS LOCAL
+!
+ssh 192.168.100.0 255.255.255.0 management
+ssh timeout 5
+ssh version 2
+!
+snmp-server host management 192.168.100.20 version 3 BANKMON
+!
+logging enable
+logging host management 192.168.100.20
+logging trap informational
+!
+! PCI-DSS Segmentation ACLs
+access-list CORE-BANKING extended permit ip any 192.168.10.0 255.255.255.0
+access-list ATM-DENY extended deny ip 192.168.20.0 255.255.255.0 192.168.10.0 255.255.255.0
+access-list WIFI-DENY extended deny ip 192.168.40.0 255.255.255.0 192.168.10.0 255.255.255.0
+access-list SECURITY-PERMIT extended permit ip 192.168.50.0 255.255.255.0 any
+access-list VOIP-PERMIT extended permit ip 192.168.60.0 255.255.255.0 any
+access-list MGMT-PERMIT extended permit ip 192.168.100.0 255.255.255.0 any
+access-list OUTSIDE-IN extended permit tcp any interface outside eq https
+access-list OUTSIDE-IN extended permit tcp any interface outside eq ssh
+!
+access-group CORE-BANKING in interface inside-core1
+access-group ATM-DENY in interface inside-core1
+access-group WIFI-DENY in interface inside-core1
+access-group OUTSIDE-IN in interface outside
+!
+! --- IPS, Threat, Anomaly Detection, DoS, Compliance ---
+threat-detection basic-threat
+threat-detection statistics host
+threat-detection statistics port
+threat-detection statistics tcp-intercept
+!
+! --- Deep Packet Inspection for Banking/Fraud ---
+detection engine deep-inspect ip 192.168.10.0 255.255.255.0
+detection engine anomaly-detect
+!
+service-policy global_policy global
+!
+! --- Management ---
+username admin password !REDACTED! privilege 15
+username noc password !REDACTED! privilege 15
+!
+crypto key generate rsa modulus 4096
+!
+! --- Audit/Compliance Logging ---
+archive
+ log config
+ logging enable
+ notify syslog
+ path disk0:/archive/
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 6: BR-WLC-01 (Cisco 5520 Wireless LAN Controller) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-WLC-01
+!
+service interface address 192.168.100.15 255.255.255.0
+!
+!
+ntp server 10.10.255.6
+logging buffered 16384
+!
+! ===== END SECTION =====
+
+! ===== SECTION: WLAN Configuration =====
+! Corporate Secure SSID (Bank-Staff) - VLAN 30
+config wlan create 1 Bank-Staff
+config wlan interface 1 30
+config wlan security wpa akm 802.1x
+config wlan radius_server auth add 1 192.168.100.21 1812 ascii !REDACTED!
+config wlan radius_server acct add 1 192.168.100.21 1813 ascii !REDACTED!
+config wlan security wpa akm 802.1x enable 1
+config wlan dhcp_server_ip_address 192.168.30.254
+
+! Guest WiFi SSID (Bank-Guest) - VLAN 40
+config wlan create 2 Bank-Guest
+config wlan interface 2 40
+config wlan security wpa akm psk set-key ascii 2 !REDACTED!
+config wlan security wpa akm psk enable 2
+config wlan dhcp_server_ip_address 192.168.40.254
+config wlan vlan id add 2 40
+
+! AP Provisioning - Assign to both VLANs
+config ap group create Branch-APs
+config ap group interface add Branch-APs Bank-Staff 30
+config ap group interface add Branch-APs Bank-Guest 40
+!
+config ap provision Branch-APs
+!
+! Bandwidth Limit Guest
+config wlan bandwidth 2 2048
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEVICE 7: BR-VOICEGW-01 (Cisco ISR 4321) ===
+
+! ===== SECTION: Basic Configuration =====
+hostname BR-VOICEGW-01
+no ip domain-lookup
+ip domain-name branchbank.int
+service timestamps debug datetime msec
+service timestamps log datetime msec
+service password-encryption
+enable secret !REDACTED!
+username admin privilege 15 secret !REDACTED!
+!
+crypto key generate rsa modulus 4096
+ip ssh version 2
+vtp mode transparent
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Voice & Interface Configuration =====
+interface GigabitEthernet0/0/0
+ description Uplink to BR-CORE1 Gi1/1/2
+ ip address 192.168.60.10 255.255.255.0
+ no shutdown
+!
+voice service voip
+ ip address trusted list
+ ipv4 192.168.60.0 255.255.255.0
+ allow-connections sip to sip
+ sip
+  bind all source-interface GigabitEthernet0/0/0
+!
+voice-card 0
+!
+dial-peer voice 1 voip
+ destination-pattern 9T
+ session protocol sipv2
+ session target ipv4:192.168.60.1
+ codec g711ulaw
+!
+! ===== END SECTION =====
+
+! ===== SECTION: QoS & Security =====
+class-map match-any VOICE
+ match ip dscp ef
+!
+policy-map VOICE-QOS
+ class VOICE
+  priority 512
+ class class-default
+  fair-queue
+!
+interface GigabitEthernet0/0/0
+ service-policy output VOICE-QOS
+!
+! SNMP, Management, Logging
+snmp-server community BANKMON ro 10
+snmp-server host 192.168.100.20 version 3 auth BANKMON
+!
+copy running-config startup-config
+! ===== END SECTION =====
+
+---
+
+=== DEPLOYMENT RECOMMENDATIONS ===
+
+Installation Sequence:
+1. Configure core C9300 switch stack, VLANs, SVIs, trunk links, HSRP, OSPF.
+2. Configure secondary core/distribution (C9300-24T), trunk and p2p links, HSRP, OSPF.
+3. Deploy ASA firewall: inside/outside/management interfaces, security policy, IPS, ACLs.
+4. Configure ISR 4331 router: WAN/internet/backup, P2P to Cores, routing, AAA, NAT, QoS, security.
+5. Deploy ISR 4321 Voice Gateway: SIP/voice interfaces and QoS.
+6. Configure access switches: VLANs, access/trunk, port security, PoE, SNMP.
+7. Bring up WLC 5520 and provision APs, SSIDs, security policies, RADIUS.
+8. Test management plane: SNMP, SSH, AAA, syslog.
+9. Verify branch connectivity, segment reachability, security policies, and failover.
+
+Verification Procedures:
+- Use `show standby`, `show ospf neighbor`, `show spanning-tree`, `show interfaces status`, `show logging`, `show ip route`, `show interfaces trunk`, `show vlan brief`
+- `show run | b tacacs`, `show snmp`, `show voice port summary`, `show policy-map interface`
+- `show access-list`, `show threat-detection statistics` on ASA
+- Confirm VLAN and trunk config on both sides of all trunks with matching allowed VLANs
+- Simulate link and device failover, confirm HSRP/failover works
+- Trace firewall traffic to validate PCI-DSS segmentation (e.g., `packet-tracer` ASA)
+
+=== DEPLOYMENT SUCCESS CRITERIA ===
+
+✓ CONNECTIVITY: All VLANs reachable as per policy; ATM/WiFi cannot reach core banking
+✓ ROUTING: OSPF converges across all core devices and router, no area mismatches
+✓ SECURITY: Firewall rules enforce segmentation; portfolios, logs, alerts pop as per audit policy
+✓ MANAGEMENT: SNMPv3/Syslog reach NOC; AAA/SSH enable privileged, MFA-protected, logged access
+✓ REDUNDANCY: Stackwise, HSRP, dual WAN, and failover policies verified under simulated failure
